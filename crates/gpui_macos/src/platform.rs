@@ -186,6 +186,11 @@ pub(crate) struct MacPlatformState {
     text_system: Arc<dyn PlatformTextSystem>,
     renderer_context: renderer::Context,
     headless: bool,
+    /// Hosted inside another application's run loop (e.g. Electron): GPUI must not
+    /// install its app delegate, run `NSApp`, or replace the main menu.
+    embedded: bool,
+    /// The GPUI delegate object while embedded, since it isn't `NSApp`'s delegate.
+    embedded_delegate: id,
     activation_policy: ActivationPolicy,
     application_created: bool,
     general_pasteboard: Pasteboard,
@@ -250,6 +255,8 @@ impl MacPlatform {
 
         let state = Mutex::new(MacPlatformState {
             headless,
+            embedded: false,
+            embedded_delegate: nil,
             activation_policy: ActivationPolicy::Regular,
             application_created: false,
             text_system,
@@ -278,6 +285,54 @@ impl MacPlatform {
             system_notifications: crate::system_notifications::SystemNotificationState::new(),
         });
         Self(state, marker)
+    }
+
+    /// Create a platform for hosting GPUI inside an application that already owns
+    /// `NSApp` and its run loop. Start it with `Application::run_embedded`.
+    pub fn new_embedded() -> Self {
+        let platform = Self::new(false);
+        platform.0.lock().embedded = true;
+        platform
+    }
+
+    /// GPUI's app delegate: `NSApp`'s delegate normally, or the detached delegate
+    /// object when embedded.
+    unsafe fn app_delegate(&self) -> id {
+        let embedded_delegate = self.0.lock().embedded_delegate;
+        if embedded_delegate != nil {
+            return embedded_delegate;
+        }
+        unsafe {
+            let app: id = msg_send![APP_CLASS, sharedApplication];
+            NSWindow::delegate(app)
+        }
+    }
+
+    /// Embedded counterpart of `run`: wire up the delegate without installing it on
+    /// `NSApp`, then finish launching immediately instead of entering `[NSApp run]`.
+    fn run_embedded(&self, on_finish_launching: Box<dyn FnOnce()>) {
+        {
+            let mut state = self.0.lock();
+            state.finish_launching = Some(on_finish_launching);
+            state.application_created = true;
+        }
+        unsafe {
+            let app_delegate: id = msg_send![APP_DELEGATE_CLASS, new];
+            let self_ptr = self as *const Self as *const c_void;
+            (*app_delegate).set_ivar(MAC_PLATFORM_IVAR, self_ptr);
+            self.0.lock().embedded_delegate = app_delegate;
+
+            will_finish_launching(
+                &mut *app_delegate,
+                sel!(applicationWillFinishLaunching:),
+                nil,
+            );
+            did_finish_launching(
+                &mut *app_delegate,
+                sel!(applicationDidFinishLaunching:),
+                nil,
+            );
+        }
     }
 
     unsafe fn create_menu_bar(
@@ -525,12 +580,10 @@ impl MacPlatform {
         // delegate lookup goes through the typed binding.
         // SAFETY: APP_CLASS is registered during startup and `sharedApplication`
         // returns a live NSApplication instance.
-        let delegate = unsafe {
-            let app: id = msg_send![APP_CLASS, sharedApplication];
-            (*(app as *const objc2_app_kit::NSApplication)).delegate()
-        };
-        if let Some(delegate) = delegate {
-            register_system_power_observers(delegate.as_ref());
+        let delegate = unsafe { self.app_delegate() };
+        if delegate != nil {
+            // SAFETY: `delegate` is a live Objective-C object; only the pointer's type changes.
+            register_system_power_observers(unsafe { &*(delegate as *const AnyObject) });
             self.0.lock().system_power_observers_registered = true;
         }
     }
@@ -550,6 +603,11 @@ impl Platform for MacPlatform {
     }
 
     fn run(&self, on_finish_launching: Box<dyn FnOnce()>) {
+        if self.0.lock().embedded {
+            self.run_embedded(on_finish_launching);
+            return;
+        }
+
         let mut state = self.0.lock();
         if state.headless {
             drop(state);
@@ -669,7 +727,7 @@ impl Platform for MacPlatform {
     fn set_activation_policy(&self, policy: ActivationPolicy) {
         let mut state = self.0.lock();
         state.activation_policy = policy;
-        let should_apply = state.application_created && !state.headless;
+        let should_apply = state.application_created && !state.headless && !state.embedded;
         drop(state);
         if should_apply {
             unsafe {
@@ -1154,6 +1212,11 @@ impl Platform for MacPlatform {
     }
 
     fn set_menus(&self, menus: Vec<Menu>, keymap: &Keymap) {
+        // The host application owns the menu bar when embedded.
+        if self.0.lock().embedded {
+            self.0.lock().menus = Some(menus.into_iter().map(|menu| menu.owned()).collect());
+            return;
+        }
         unsafe {
             let app: id = msg_send![APP_CLASS, sharedApplication];
             let mut state = self.0.lock();
@@ -1171,10 +1234,10 @@ impl Platform for MacPlatform {
 
     fn set_dock_menu(&self, menu: Vec<MenuItem>, keymap: &Keymap) {
         unsafe {
-            let app: id = msg_send![APP_CLASS, sharedApplication];
+            let delegate = self.app_delegate();
             let mut state = self.0.lock();
             let actions = &mut state.menu_actions;
-            let new = self.create_dock_menu(menu, NSWindow::delegate(app), actions, keymap);
+            let new = self.create_dock_menu(menu, delegate, actions, keymap);
             if let Some(old) = state.dock_menu.replace(new) {
                 CFRelease(old as _)
             }
@@ -1395,9 +1458,15 @@ extern "C" fn will_finish_launching(_this: &mut Object, _: Sel, _: id) {
 
 extern "C" fn did_finish_launching(this: &mut Object, _: Sel, _: id) {
     unsafe {
-        let app: id = msg_send![APP_CLASS, sharedApplication];
-        let policy = get_mac_platform(this).0.lock().activation_policy;
-        app.setActivationPolicy_(native_activation_policy(policy));
+        let (policy, embedded) = {
+            let state = get_mac_platform(this).0.lock();
+            (state.activation_policy, state.embedded)
+        };
+        // The host application owns the activation policy when embedded.
+        if !embedded {
+            let app: id = msg_send![APP_CLASS, sharedApplication];
+            app.setActivationPolicy_(native_activation_policy(policy));
+        }
 
         let notification_center: *mut Object =
             msg_send![class!(NSNotificationCenter), defaultCenter];
