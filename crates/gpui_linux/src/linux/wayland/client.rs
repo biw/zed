@@ -247,7 +247,7 @@ pub struct Globals {
         Option<zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1>,
     pub wm_base: xdg_wm_base::XdgWmBase,
     pub shm: wl_shm::WlShm,
-    pub seat: wl_seat::WlSeat,
+    pub seat: Option<wl_seat::WlSeat>,
     pub viewporter: Option<wp_viewporter::WpViewporter>,
     pub fractional_scale_manager:
         Option<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1>,
@@ -267,7 +267,7 @@ impl Globals {
         globals: GlobalList,
         executor: ForegroundExecutor,
         qh: QueueHandle<WaylandClientStatePtr>,
-        seat: wl_seat::WlSeat,
+        seat: Option<wl_seat::WlSeat>,
         frame_ping: Ping,
     ) -> anyhow::Result<Self> {
         let dialog_v = XdgWmDialogV1::interface().version;
@@ -353,7 +353,7 @@ pub(crate) struct WaylandClientState {
     globals: Globals,
     pub gpu_context: GpuContext,
     pub compositor_gpu: Option<CompositorGpuHint>,
-    wl_seat: wl_seat::WlSeat, // TODO: Multi seat support
+    wl_seat: Option<wl_seat::WlSeat>, // TODO: Multi seat support
     wl_pointer: Option<wl_pointer::WlPointer>,
     pinch_gesture: Option<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1>,
     pinch_scale: f32,
@@ -993,7 +993,7 @@ impl WaylandConnection {
 
         let (frame_ping, frame_ping_source) =
             calloop::ping::make_ping().context("failed to create Wayland frame ping")?;
-        let seat = seat.context("Wayland compositor does not provide wl_seat")?;
+        // Headless compositors can render windows without exposing an input seat.
         let foreground_executor = common.borrow().foreground_executor.clone();
         let background_executor = common.borrow().background_executor.clone();
         let globals = Globals::new(
@@ -1005,15 +1005,18 @@ impl WaylandConnection {
         )
         .context("failed to bind required Wayland globals")?;
 
-        let data_device = globals
-            .data_device_manager
-            .as_ref()
-            .map(|data_device_manager| data_device_manager.get_data_device(&seat, &qh, ()));
+        let data_device =
+            globals.data_device_manager.as_ref().zip(seat.as_ref()).map(
+                |(data_device_manager, seat)| data_device_manager.get_data_device(seat, &qh, ()),
+            );
 
         let primary_selection = globals
             .primary_selection_manager
             .as_ref()
-            .map(|primary_selection_manager| primary_selection_manager.get_device(&seat, &qh, ()));
+            .zip(seat.as_ref())
+            .map(|(primary_selection_manager, seat)| {
+                primary_selection_manager.get_device(seat, &qh, ())
+            });
 
         let cursor = Cursor::new(&conn, &globals, 24);
 
@@ -1257,7 +1260,11 @@ impl WaylandConnection {
                         .get(SerialKind::MousePress)
                         .as_raw()
                         .max(state.serial_tracker.get(SerialKind::KeyPress).as_raw());
-                    (serial != 0).then(|| (serial, state.wl_seat.clone()))
+                    state
+                        .wl_seat
+                        .clone()
+                        .filter(|_| serial != 0)
+                        .map(|seat| (serial, seat))
                 });
                 (Some(parent), popup_grab.flatten())
             }
@@ -1347,14 +1354,15 @@ impl WaylandConnection {
 
     pub(crate) fn open_uri(&self, uri: &str) {
         let mut state = self.0.borrow_mut();
-        if let (Some(activation), Some(window)) = (
+        if let (Some(activation), Some(window), Some(seat)) = (
             state.globals.activation.clone(),
             state.mouse_focused_window.clone(),
+            state.wl_seat.clone(),
         ) {
             state.pending_activation = Some(PendingActivation::Uri(uri.to_string()));
             let token = activation.get_activation_token(&state.globals.qh, ());
             let serial = state.serial_tracker.get(SerialKind::MousePress);
-            token.set_serial(serial.as_raw(), &state.wl_seat);
+            token.set_serial(serial.as_raw(), &seat);
             token.set_surface(&window.surface());
             token.commit();
         } else {
@@ -1365,14 +1373,15 @@ impl WaylandConnection {
 
     pub(crate) fn reveal_path(&self, path: PathBuf) {
         let mut state = self.0.borrow_mut();
-        if let (Some(activation), Some(window)) = (
+        if let (Some(activation), Some(window), Some(seat)) = (
             state.globals.activation.clone(),
             state.mouse_focused_window.clone(),
+            state.wl_seat.clone(),
         ) {
             state.pending_activation = Some(PendingActivation::Path(path));
             let token = activation.get_activation_token(&state.globals.qh, ());
             let serial = state.serial_tracker.get(SerialKind::MousePress);
-            token.set_serial(serial.as_raw(), &state.wl_seat);
+            token.set_serial(serial.as_raw(), &seat);
             token.set_surface(&window.surface());
             token.commit();
         } else {
@@ -1566,8 +1575,22 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                     if let Some(wl_keyboard) = state.wl_keyboard.take() {
                         wl_keyboard.release();
                     }
-                    state.wl_seat.release();
-                    state.wl_seat = registry.bind::<wl_seat::WlSeat, _, _>(name, version, qh, ());
+                    if let Some(seat) = state.wl_seat.take() {
+                        seat.release();
+                    }
+                    let seat = registry.bind::<wl_seat::WlSeat, _, _>(name, version, qh, ());
+                    state.data_device = state
+                        .globals
+                        .data_device_manager
+                        .as_ref()
+                        .map(|manager| manager.get_data_device(&seat, qh, ()));
+                    state.primary_selection = state
+                        .globals
+                        .primary_selection_manager
+                        .as_ref()
+                        .map(|manager| manager.get_device(&seat, qh, ()));
+                    state.globals.seat = Some(seat.clone());
+                    state.wl_seat = Some(seat);
                 }
                 "wl_output" => {
                     let Ok(version) = wl_output_version(version) else {
