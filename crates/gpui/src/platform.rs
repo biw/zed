@@ -1197,6 +1197,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn is_hovered(&self) -> bool;
     fn background_appearance(&self) -> WindowBackgroundAppearance;
     fn set_title(&mut self, title: &str);
+
+    /// Requests a floating window level when the window system supports it.
+    fn set_always_on_top(&self, _on_top: bool) {}
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance);
     fn minimize(&self);
     fn zoom(&self);

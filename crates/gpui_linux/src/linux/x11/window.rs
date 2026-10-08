@@ -63,6 +63,7 @@ x11rb::atom_manager! {
         _NET_WM_NAME,
         _NET_WM_ICON,
         _NET_WM_STATE,
+        _NET_WM_STATE_ABOVE,
         _NET_WM_STATE_MAXIMIZED_VERT,
         _NET_WM_STATE_MAXIMIZED_HORZ,
         _NET_WM_STATE_FULLSCREEN,
@@ -912,8 +913,8 @@ impl Drop for X11Window {
 }
 
 enum WmHintPropertyState {
-    // Remove = 0,
-    // Add = 1,
+    Remove = 0,
+    Add = 1,
     Toggle = 2,
 }
 
@@ -1648,6 +1649,21 @@ impl PlatformWindow for X11Window {
                     .is_some_and(|ctx| ctx.supports_dual_source_blending())
             })
             .unwrap_or_default()
+    }
+
+    fn set_always_on_top(&self, on_top: bool) {
+        let atom = self.0.state.borrow().atoms._NET_WM_STATE_ABOVE;
+        self.set_wm_hints(
+            || "X11 setting floating window level failed",
+            if on_top {
+                WmHintPropertyState::Add
+            } else {
+                WmHintPropertyState::Remove
+            },
+            atom,
+            0,
+        )
+        .log_err();
     }
 
     fn minimize(&self) {

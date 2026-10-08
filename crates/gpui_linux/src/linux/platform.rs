@@ -273,10 +273,12 @@ async fn listen_for_system_power_events(
 /// One event loop serves the whole process. The foreground executor and power listener are
 /// registered on it once, and the current [`DisplayConnection`] adds and removes its own sources
 /// as the app switches between the display modes it allows.
-pub(crate) struct LinuxPlatform {
+pub struct LinuxPlatform {
     common: Rc<RefCell<LinuxCommon>>,
     /// The event loop, until `run` takes it.
     event_loop: RefCell<Option<EventLoop<'static, ()>>>,
+    embedded: bool,
+    dispatching: std::cell::Cell<bool>,
     loop_handle: LoopHandle<'static, ()>,
     connection: RefCell<DisplayConnection>,
     allowed_modes: WindowingModes,
@@ -322,6 +324,8 @@ impl LinuxPlatform {
         Self {
             common,
             event_loop: RefCell::new(Some(event_loop)),
+            embedded: false,
+            dispatching: std::cell::Cell::new(false),
             loop_handle,
             connection: RefCell::new(DisplayConnection::Headless(HeadlessConnection::new())),
             allowed_modes,
@@ -330,6 +334,33 @@ impl LinuxPlatform {
             pending_mode: RefCell::new(None),
             transition_waiter: RefCell::new(None),
         }
+    }
+
+    /// Creates a windowed platform whose host owns the main loop.
+    pub fn new_embedded() -> Self {
+        let mut platform = Self::new(WindowingModes::X11 | WindowingModes::WAYLAND);
+        platform.embedded = true;
+        platform
+    }
+
+    /// Processes pending events without blocking the host's main thread.
+    pub fn poll_events(&self) -> anyhow::Result<()> {
+        if !self.embedded || self.dispatching.replace(true) {
+            return Ok(());
+        }
+        // Reset even if a callback unwinds into the host's panic boundary.
+        struct DispatchGuard<'a>(&'a std::cell::Cell<bool>);
+        impl Drop for DispatchGuard<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        let _guard = DispatchGuard(&self.dispatching);
+        if let Some(event_loop) = self.event_loop.borrow_mut().as_mut() {
+            event_loop.dispatch(std::time::Duration::ZERO, &mut ())?;
+        }
+        self.apply_pending_mode();
+        Ok(())
     }
 
     /// Connects in the initial mode, before the app finishes launching.
@@ -598,6 +629,10 @@ impl Platform for LinuxPlatform {
         self.connect_initially();
         on_finish_launching();
 
+        if self.embedded {
+            return;
+        }
+
         let mut event_loop = self
             .event_loop
             .borrow_mut()
@@ -617,6 +652,12 @@ impl Platform for LinuxPlatform {
 
     fn quit(&self) {
         self.with_common(|common| common.signal.stop());
+        if self.embedded {
+            let quit = self.with_common(|common| common.callbacks.quit.take());
+            if let Some(mut quit) = quit {
+                quit();
+            }
+        }
     }
 
     fn set_initial_windowing(&self, request: WindowingRequest) {

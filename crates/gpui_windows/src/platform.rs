@@ -29,7 +29,10 @@ use windows::{
             Power::*,
             SystemInformation::*,
             SystemServices::POWER_REQUEST_CONTEXT_VERSION,
-            Threading::{POWER_REQUEST_CONTEXT_SIMPLE_STRING, REASON_CONTEXT, REASON_CONTEXT_0},
+            Threading::{
+                GetCurrentThreadId, POWER_REQUEST_CONTEXT_SIMPLE_STRING, REASON_CONTEXT,
+                REASON_CONTEXT_0,
+            },
         },
         UI::{Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
     },
@@ -51,6 +54,7 @@ impl TrackedWindow {
 }
 
 pub struct WindowsPlatform {
+    embedded_message_hook: Option<HHOOK>,
     inner: Rc<WindowsPlatformInner>,
     raw_window_handles: Arc<RwLock<SmallVec<[TrackedWindow; 4]>>>,
     /// The windowing mode to start in, applied when `run` starts. Windowed when unset.
@@ -78,6 +82,7 @@ pub struct WindowsPlatform {
 }
 
 struct WindowsPlatformInner {
+    embedded: Cell<bool>,
     state: WindowsPlatformState,
     raw_window_handles: std::sync::Weak<RwLock<SmallVec<[TrackedWindow; 4]>>>,
     // The below members will never change throughout the entire lifecycle of the app.
@@ -262,6 +267,7 @@ impl WindowsPlatform {
         };
 
         Ok(Self {
+            embedded_message_hook: None,
             inner,
             handle,
             raw_window_handles,
@@ -281,6 +287,21 @@ impl WindowsPlatform {
             app_identity: RefCell::new(None),
             system_notifications: RefCell::new(SystemNotificationState::new()),
         })
+    }
+
+    /// Creates a platform that leaves message dispatch and process shutdown to its host.
+    pub fn new_embedded() -> Result<Self> {
+        let mut platform = Self::new(false)?;
+        platform.inner.embedded.set(true);
+        platform.embedded_message_hook = Some(unsafe {
+            SetWindowsHookExW(
+                WH_GETMESSAGE,
+                Some(embedded_message_hook),
+                None,
+                GetCurrentThreadId(),
+            )?
+        });
+        Ok(platform)
     }
 
     pub(crate) fn window_from_hwnd(&self, hwnd: HWND) -> Option<Rc<WindowsWindowInner>> {
@@ -495,6 +516,27 @@ impl WindowsPlatform {
     }
 }
 
+unsafe extern "system" fn embedded_message_hook(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if code >= 0 && wparam.0 == PM_REMOVE.0 as usize {
+        let message = unsafe { &mut *(lparam.0 as *mut MSG) };
+        let mut class_name = [0u16; 64];
+        let length = unsafe { GetClassNameW(message.hwnd, &mut class_name) } as usize;
+        if class_name[..length]
+            .iter()
+            .copied()
+            .eq("Zed::Window".encode_utf16())
+            && translate_accelerator(message).is_some()
+        {
+            message.message = WM_NULL;
+        }
+    }
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
 fn translate_accelerator(msg: &MSG) -> Option<()> {
     if msg.message != WM_KEYDOWN && msg.message != WM_SYSKEYDOWN {
         return None;
@@ -595,6 +637,9 @@ impl Platform for WindowsPlatform {
             self.connect_initially();
         }
         on_finish_launching();
+        if self.inner.embedded.get() {
+            return;
+        }
 
         let mut msg = MSG::default();
         unsafe {
@@ -615,6 +660,15 @@ impl Platform for WindowsPlatform {
     }
 
     fn quit(&self) {
+        if self.inner.embedded.get() {
+            self.inner.with_callback(
+                |callbacks| &callbacks.quit,
+                |callback| {
+                    callback();
+                },
+            );
+            return;
+        }
         self.foreground_executor()
             .spawn(async { unsafe { PostQuitMessage(0) } })
             .detach();
@@ -649,6 +703,9 @@ impl Platform for WindowsPlatform {
     }
 
     fn restart(&self, binary_path: Option<PathBuf>, arguments: Vec<OsString>) {
+        if self.inner.embedded.get() {
+            return;
+        }
         let pid = std::process::id();
         let Some(app_path) = binary_path.or(self.app_path().log_err()) else {
             return;
@@ -1139,6 +1196,7 @@ impl WindowsPlatformInner {
     fn new(context: &mut PlatformWindowCreateContext) -> Result<Rc<Self>> {
         let state = WindowsPlatformState::new(context.directx_devices.take());
         Ok(Rc::new(Self {
+            embedded: Cell::new(false),
             state,
             raw_window_handles: context.raw_window_handles.clone(),
             dispatcher: context
@@ -1217,6 +1275,9 @@ impl WindowsPlatformInner {
             |callback| shutdown_completed = callback(),
         );
         log::logger().flush();
+        if self.embedded.get() {
+            return Some(0);
+        }
         if shutdown_completed {
             std::process::exit(0);
         }
@@ -1267,10 +1328,10 @@ impl WindowsPlatformInner {
                     };
                     // We need to process a paint message here as otherwise we will re-enter `run_foreground_task` before painting if we have work remaining.
                     // The reason for this is that windows prefers custom application message processing over system messages.
-                    if peek_msg(&mut msg, PM_QS_PAINT) {
+                    if !self.embedded.get() && peek_msg(&mut msg, PM_QS_PAINT) {
                         process_message(&msg);
                     }
-                    while peek_msg(&mut msg, PM_QS_INPUT) {
+                    while !self.embedded.get() && peek_msg(&mut msg, PM_QS_INPUT) {
                         process_message(&msg);
                     }
                     // Allow the main loop to process other gpui events before going back into `run_foreground_task`
@@ -1369,6 +1430,9 @@ impl Drop for WindowsPlatform {
             stop.store(true, Ordering::Release);
         }
         unsafe {
+            if let Some(hook) = self.embedded_message_hook.take() {
+                UnhookWindowsHookEx(hook).log_err();
+            }
             if let Some(notification) = self.suspend_resume_notification.borrow_mut().take() {
                 // SAFETY: notification was returned by RegisterSuspendResumeNotification.
                 UnregisterSuspendResumeNotification(notification).log_err();

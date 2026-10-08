@@ -18,6 +18,7 @@ pub use dispatcher::*;
 pub(crate) use display_connection::{Backend, DisplayConnection, select_backend};
 pub(crate) use headless::*;
 pub(crate) use keyboard::*;
+pub use platform::LinuxPlatform;
 pub(crate) use platform::*;
 #[cfg(any(feature = "wayland", feature = "x11"))]
 pub(crate) use text_system::*;

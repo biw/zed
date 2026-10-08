@@ -113,7 +113,28 @@ fn get_adapter(
     D3D_FEATURE_LEVEL,
 )> {
     for adapter_index in 0.. {
-        let adapter: IDXGIAdapter1 = unsafe { dxgi_factory.EnumAdapters(adapter_index)?.cast()? };
+        let adapter: IDXGIAdapter1 = match unsafe { dxgi_factory.EnumAdapters(adapter_index) } {
+            Ok(adapter) => adapter.cast()?,
+            Err(_) => {
+                // A host or CI machine may have no hardware adapter. WARP still provides
+                // the same Direct3D surface API, without claiming the host's GPU policy.
+                let adapter: IDXGIAdapter1 = unsafe { dxgi_factory.EnumWarpAdapter()? };
+                let mut context = None;
+                let mut feature_level = D3D_FEATURE_LEVEL::default();
+                let device = get_device(
+                    &adapter,
+                    Some(&mut context),
+                    Some(&mut feature_level),
+                    debug_layer_available,
+                )?;
+                return Ok((
+                    adapter,
+                    device,
+                    context.context("WARP returned no device context")?,
+                    feature_level,
+                ));
+            }
+        };
         if let Ok(desc) = unsafe { adapter.GetDesc1() } {
             let gpu_name = String::from_utf16_lossy(&desc.Description)
                 .trim_matches(char::from(0))

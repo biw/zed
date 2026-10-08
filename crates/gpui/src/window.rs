@@ -6546,6 +6546,11 @@ impl Window {
         self.platform_window.minimize();
     }
 
+    /// Requests a floating window level. Unsupported compositors leave it unchanged.
+    pub fn set_always_on_top(&self, on_top: bool) {
+        self.platform_window.set_always_on_top(on_top);
+    }
+
     /// Toggle full screen status on the current window at the platform level.
     pub fn toggle_fullscreen(&self) {
         self.platform_window.toggle_fullscreen();

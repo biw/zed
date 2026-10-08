@@ -943,6 +943,21 @@ impl PlatformWindow for WindowsWindow {
         unsafe { ShowWindowAsync(self.0.hwnd, SW_MINIMIZE).ok().log_err() };
     }
 
+    fn set_always_on_top(&self, on_top: bool) {
+        unsafe {
+            SetWindowPos(
+                self.0.hwnd,
+                Some(if on_top { HWND_TOPMOST } else { HWND_NOTOPMOST }),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+            .log_err();
+        }
+    }
+
     fn zoom(&self) {
         unsafe {
             if IsWindowVisible(self.0.hwnd).as_bool() {
