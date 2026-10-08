@@ -309,11 +309,22 @@ struct StartupEnvironment {
 impl LinuxPlatform {
     /// Creates the platform, headless until `run` connects it in its initial mode.
     pub(crate) fn new(allowed_modes: WindowingModes) -> Self {
-        let startup = StartupEnvironment {
-            #[cfg(feature = "wayland")]
-            activation_token: crate::linux::take_startup_activation_token_from_environment(),
-            #[cfg(feature = "wayland")]
-            wayland_socket: crate::linux::take_wayland_socket_from_environment(),
+        Self::new_with_embedded(allowed_modes, false)
+    }
+
+    fn new_with_embedded(allowed_modes: WindowingModes, embedded: bool) -> Self {
+        // An embedded host already owns its activation token and inherited Wayland
+        // socket, and may have threads reading the environment. Open our own display
+        // connection without taking or mutating any host startup environment.
+        let startup = if embedded {
+            StartupEnvironment::default()
+        } else {
+            StartupEnvironment {
+                #[cfg(feature = "wayland")]
+                activation_token: crate::linux::take_startup_activation_token_from_environment(),
+                #[cfg(feature = "wayland")]
+                wayland_socket: crate::linux::take_wayland_socket_from_environment(),
+            }
         };
         let event_loop = EventLoop::try_new().expect("failed to create Linux event loop");
         let (common, main_receiver, power_receiver) = LinuxCommon::new(event_loop.get_signal());
@@ -324,7 +335,7 @@ impl LinuxPlatform {
         Self {
             common,
             event_loop: RefCell::new(Some(event_loop)),
-            embedded: false,
+            embedded,
             dispatching: std::cell::Cell::new(false),
             loop_handle,
             connection: RefCell::new(DisplayConnection::Headless(HeadlessConnection::new())),
@@ -338,9 +349,7 @@ impl LinuxPlatform {
 
     /// Creates a windowed platform whose host owns the main loop.
     pub fn new_embedded() -> Self {
-        let mut platform = Self::new(WindowingModes::X11 | WindowingModes::WAYLAND);
-        platform.embedded = true;
-        platform
+        Self::new_with_embedded(WindowingModes::X11 | WindowingModes::WAYLAND, true)
     }
 
     /// Processes pending events without blocking the host's main thread.
