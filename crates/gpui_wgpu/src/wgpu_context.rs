@@ -470,27 +470,8 @@ impl WgpuContext {
 
     #[cfg(not(target_family = "wasm"))]
     pub fn instance(display: Option<Box<dyn wgpu::wgt::WgpuHasDisplayHandle>>) -> wgpu::Instance {
-        let backends = wgpu::Backends::VULKAN | wgpu::Backends::GL;
-        #[cfg(target_os = "linux")]
-        let backends = if display.as_ref().is_some_and(|display| {
-            display.display_handle().is_ok_and(|handle| {
-                matches!(
-                    handle.as_raw(),
-                    raw_window_handle::RawDisplayHandle::Wayland(_)
-                )
-            })
-        }) && host_exports_private_wayland()
-        {
-            // Older Electron versions export a private libwayland implementation.
-            // Mesa EGL can bind to those functions while using system libwayland
-            // objects, crashing during GLES surface creation even when Vulkan
-            // would ultimately be selected. Do not probe GLES in that host.
-            wgpu::Backends::VULKAN
-        } else {
-            backends
-        };
         wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends,
+            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
             flags: wgpu::InstanceFlags::default(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
@@ -764,31 +745,6 @@ impl WgpuContext {
     pub fn errors(&self) -> &Arc<DeviceErrorState> {
         &self.errors
     }
-}
-
-#[cfg(target_os = "linux")]
-fn host_exports_private_wayland() -> bool {
-    use std::os::unix::ffi::OsStrExt;
-
-    // A dynamically loaded system libwayland remains compatible with Mesa.
-    // Only suppress EGL when a different object supplies the global symbols.
-    let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"wl_proxy_marshal_flags".as_ptr()) };
-    if symbol.is_null() {
-        return false;
-    }
-    let mut info = std::mem::MaybeUninit::<libc::Dl_info>::uninit();
-    if unsafe { libc::dladdr(symbol, info.as_mut_ptr()) } == 0 {
-        return true;
-    }
-    let info = unsafe { info.assume_init() };
-    if info.dli_fname.is_null() {
-        return true;
-    }
-    let filename = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) };
-    let path = std::path::Path::new(std::ffi::OsStr::from_bytes(filename.to_bytes()));
-    !path
-        .file_name()
-        .is_some_and(|name| name.as_bytes().starts_with(b"libwayland-client."))
 }
 
 #[cfg(not(target_family = "wasm"))]
